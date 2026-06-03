@@ -906,6 +906,10 @@
     const cfHtml=renderCustomFieldsEditor(r.customFields||[]);
     document.getElementById('editorModal').innerHTML=`
       <h2>${editingId?'✏️ 編輯配方':'➕ 新增配方'}（${r.category}）</h2>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <button id="btn-ai-scan" class="btn btn-sm" style="background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;border:none;padding:10px 16px;font-size:13px;font-weight:600;flex:1;" onclick="scanRecipeImage('camera')">📷 拍照辨識</button>
+        <button class="btn btn-sm" style="background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;border:none;padding:10px 16px;font-size:13px;font-weight:600;flex:1;" onclick="scanRecipeImage('file')">🖼️ 上傳圖片</button>
+      </div>
       <div class="field"><label>配方名稱</label><input id="f-name" value="${esc(r.name)}" placeholder="例：春日花園香水" oninput="window._editing.name=this.value"></div>
       ${concSel}
       <div class="field"><label>容量 / 淨重（標籤用）</label><input id="f-cap" value="${esc(r.capacity||'')}" placeholder="例：50ml" oninput="window._editing.capacity=this.value"></div>
@@ -1271,9 +1275,118 @@
     alert('已下載 HTML 檔案！\n\n另存為 PDF 方法：\n1. 用瀏覽器開啟下載嘅 HTML 檔案\n2. 按「🖨️ 打印 / 存 PDF」按鈕，或 Ctrl+P\n3. 印表機選「另存為 PDF」\n4. 按「儲存」');
   }
 
-      // ===== 設定 =====
+      // ===== AI 辨識（Google Gemini） =====
+  let geminiConfig=JSON.parse(localStorage.getItem('geminiConfig')||'{}');
+  function saveGeminiConfig(){localStorage.setItem('geminiConfig',JSON.stringify(geminiConfig));}
+  function doSaveGeminiConfig(){
+    geminiConfig.apiKey=document.getElementById('s-geminiKey').value.trim();
+    saveGeminiConfig();
+    alert('🤖 AI 辨識設定已儲存！');
+    renderSettingsModal();
+  }
+  function scanRecipeImage(mode){
+    if(!geminiConfig.apiKey){alert('⚠️ 請先到「設定 → AI 辨識」輸入 Gemini API Key');openSettings();return;}
+    const input=document.createElement('input');input.type='file';input.accept='image/*';
+    if(mode==='camera')input.setAttribute('capture','environment');
+    input.onchange=function(e){
+      const file=e.target.files[0];if(!file)return;
+      if(file.size>10*1024*1024){alert('⚠️ 圖片太大，請選擇 10MB 以下嘅圖片');return;}
+      const reader=new FileReader();
+      reader.onload=function(ev){
+        const base64=ev.target.result.split(',')[1];
+        const mimeType=file.type;
+        callGeminiVision(base64,mimeType);
+      };
+      reader.readAsDataURL(file);
+    };
+    input.click();
+  }
+  function callGeminiVision(base64Data,mimeType){
+    const r=window._editing;
+    const btnEl=document.getElementById('btn-ai-scan');
+    if(btnEl){btnEl.disabled=true;btnEl.textContent='⏳ 辨識中...';}
+    const prompt=`你是一個專業調香師助理。請從這張圖片中提取配方資料，以 JSON 格式返回。
+規則：
+1. 只返回 JSON，不要有任何其他文字或 markdown 標記
+2. 如果圖片中有手寫字，請盡力辨識
+3. 數值請用數字，不要加單位
+4. 找不到的欄位請留空字串或空陣列
+
+JSON 格式如下：
+{
+  "name": "配方名稱",
+  "capacity": "容量如50ml",
+  "date": "日期如2024-01-15",
+  "tags": ["標籤1","標籤2"],
+  "groups": [
+    {"name": "前調", "items": [{"name": "成分名稱", "gram": 2.5}]},
+    {"name": "中調", "items": [{"name": "成分名稱", "gram": 3.0}]},
+    {"name": "後調", "items": [{"name": "成分名稱", "gram": 1.5}]}
+  ],
+  "steps": ["步驟1描述", "步驟2描述"],
+  "note": "備註心得"
+}
+
+注意：
+- groups 的 name 常見有：前調/中調/後調、香精/酒精/純水 等
+- gram 填數字即可（克）
+- 如果圖片不是配方，返回 {"error": "無法辨識為配方資料"}`;
+
+    const xhr=new XMLHttpRequest();
+    xhr.open('POST','https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key='+geminiConfig.apiKey,true);
+    xhr.setRequestHeader('Content-Type','application/json');
+    xhr.onreadystatechange=function(){
+      if(xhr.readyState===4){
+        if(btnEl){btnEl.disabled=false;btnEl.textContent='📷 拍照/上傳辨識';}
+        if(xhr.status>=200&&xhr.status<300){
+          try{
+            const resp=JSON.parse(xhr.responseText);
+            const text=resp.candidates[0].content.parts[0].text;
+            let jsonStr=text.replace(/```json\n?/g,'').replace(/```\n?/g,'').trim();
+            const data=JSON.parse(jsonStr);
+            if(data.error){alert('⚠️ '+data.error);return;}
+            applyScannedData(data);
+          }catch(e){
+            alert('❌ 解析 AI 回應失敗：'+e.message+'\n\n請再試一次，或手動輸入。');
+          }
+        }else{
+          let msg='AI 辨識失敗';
+          try{const r2=JSON.parse(xhr.responseText);msg=r2.error?.message||msg;}catch(e){msg+='（HTTP '+xhr.status+'）';}
+          alert('❌ '+msg);
+        }
+      }
+    };
+    xhr.send(JSON.stringify({contents:[{parts:[{text:prompt},{inlineData:{mimeType:mimeType,data:base64Data}}]}],generationConfig:{temperature:0.1}}));
+  }
+  function applyScannedData(data){
+    const r=window._editing;
+    if(data.name)r.name=data.name;
+    if(data.capacity)r.capacity=data.capacity;
+    if(data.date)r.date=data.date;
+    if(data.tags&&data.tags.length)r.tags=data.tags;
+    if(data.note)r.note=data.note;
+    if(data.groups&&data.groups.length){
+      data.groups.forEach((g,gi)=>{
+        if(gi<r.groups.length){
+          r.groups[gi].name=g.name||r.groups[gi].name;
+          if(g.items&&g.items.length){
+            r.groups[gi].items=g.items.map(it=>({name:it.name||'',gram:it.gram||''}));
+          }
+        }else{
+          r.groups.push({name:g.name||'分組'+(gi+1),items:(g.items||[]).map(it=>({name:it.name||'',gram:it.gram||''}))});
+        }
+      });
+    }
+    if(data.steps&&data.steps.length){
+      r.steps=data.steps.map(s=>({desc:typeof s==='string'?s:s.desc||''}));
+    }
+    renderEditor();
+    alert('✅ AI 辨識完成！資料已填入，請檢查確認後儲存。');
+  }
+
+  // ===== 設定 =====
   function openSettings(){renderSettingsModal();document.getElementById('settingsBg').classList.add('show');}
-  function renderSettingsModal(){const tplHtml=renderCfTemplateManager();document.getElementById('settingsModal').innerHTML=`<h2>⚙️ 設定</h2><div class="settings-section"><div class="settings-section-title">品牌資訊</div><div class="field"><label>品牌名稱（標籤頂部）</label><input id="s-brand" value="${esc(settings.brand)}"></div><div class="field"><label>預設保存期限</label><input id="s-expiry" value="${esc(settings.expiry)}"></div><div class="field"><label>預設注意事項</label><textarea id="s-caution" rows="2">${esc(settings.caution)}</textarea></div><div class="btn-row"><button class="btn btn-ghost" onclick="closeSettings()">取消</button><button class="btn btn-primary" onclick="doSaveSettings()" style="flex:2;">儲存品牌設定</button></div></div><div class="settings-section"><div class="settings-section-title">自訂欄位範本管理</div><p style="font-size:13px;color:var(--rose-300);margin-bottom:12px;">為每個標籤設定欄位範本，新增配方/產品選用對應標籤時自動帶出欄位。</p>${tplHtml}<button class="btn btn-sm" style="width:100%;margin-top:8px;" onclick="addCfTemplate()">➕ 新增標籤範本</button></div><div class="settings-section"><div class="settings-section-title">☁️ 雲端同步設定</div><p style="font-size:13px;color:var(--rose-300);margin-bottom:12px;">使用 GitHub Gist 將資料同步到雲端。Gist 自帶版本歷史，可隨時翻睇舊版。設定一次後，任何裝置都可以上傳/下載。</p><div class="field"><label>GitHub Personal Access Token</label><input id="s-cloudToken" class="sync-input" value="${esc(cloudConfig.token||'')}" placeholder="ghp_xxxxxxxxxxxx"></div><div class="field"><label>Gist ID（自動建立，或手動輸入已有 Gist ID）</label><input id="s-cloudGistId" class="sync-input" value="${esc(cloudConfig.gistId||'')}" placeholder="留空 = 首次上傳時自動建立"></div><div class="sync-hint">📌 取得 Token：<br>1. 前往 <a href="https://github.com/settings/tokens" target="_blank" style="color:#4f46e5;">GitHub Settings → Tokens</a><br>2. 按「Generate new token (classic)」<br>3. 勾選 <b>gist</b> 權限即可<br>4. 複製 Token 貼到上方</div><div class="btn-row"><button class="btn btn-ghost" onclick="closeSettings()">取消</button><button class="btn btn-primary" onclick="doSaveCloudConfig()" style="flex:2;">💾 儲存同步設定</button></div>${cloudConfig.lastSync?'<div class="sync-last">🕐 最後同步：'+cloudConfig.lastSync+'</div>':''}</div></div><div class="settings-section"><div class="settings-section-title">常用成分庫</div><p style="font-size:13px;color:var(--rose-300);margin-bottom:8px;">輸入成分時會自動建議以下材料，不可編輯（系統內建）。</p><div style="font-size:12px;color:var(--rose-400);line-height:1.8;">${Object.entries(INGREDIENT_DB).map(([cat,items])=>`<b>${cat}：</b>${items.slice(0,6).map(i=>i.name).join('、')}…等 ${items.length} 種`).join('<br>')}</div></div>`;}
+  function renderSettingsModal(){const tplHtml=renderCfTemplateManager();document.getElementById('settingsModal').innerHTML=`<h2>⚙️ 設定</h2><div class="settings-section"><div class="settings-section-title">品牌資訊</div><div class="field"><label>品牌名稱（標籤頂部）</label><input id="s-brand" value="${esc(settings.brand)}"></div><div class="field"><label>預設保存期限</label><input id="s-expiry" value="${esc(settings.expiry)}"></div><div class="field"><label>預設注意事項</label><textarea id="s-caution" rows="2">${esc(settings.caution)}</textarea></div><div class="btn-row"><button class="btn btn-ghost" onclick="closeSettings()">取消</button><button class="btn btn-primary" onclick="doSaveSettings()" style="flex:2;">儲存品牌設定</button></div></div><div class="settings-section"><div class="settings-section-title">自訂欄位範本管理</div><p style="font-size:13px;color:var(--rose-300);margin-bottom:12px;">為每個標籤設定欄位範本，新增配方/產品選用對應標籤時自動帶出欄位。</p>${tplHtml}<button class="btn btn-sm" style="width:100%;margin-top:8px;" onclick="addCfTemplate()">➕ 新增標籤範本</button></div><div class="settings-section"><div class="settings-section-title">☁️ 雲端同步設定</div><p style="font-size:13px;color:var(--rose-300);margin-bottom:12px;">使用 GitHub Gist 將資料同步到雲端。Gist 自帶版本歷史，可隨時翻睇舊版。設定一次後，任何裝置都可以上傳/下載。</p><div class="field"><label>GitHub Personal Access Token</label><input id="s-cloudToken" class="sync-input" value="${esc(cloudConfig.token||'')}" placeholder="ghp_xxxxxxxxxxxx"></div><div class="field"><label>Gist ID（自動建立，或手動輸入已有 Gist ID）</label><input id="s-cloudGistId" class="sync-input" value="${esc(cloudConfig.gistId||'')}" placeholder="留空 = 首次上傳時自動建立"></div><div class="sync-hint">📌 取得 Token：<br>1. 前往 <a href="https://github.com/settings/tokens" target="_blank" style="color:#4f46e5;">GitHub Settings → Tokens</a><br>2. 按「Generate new token (classic)」<br>3. 勾選 <b>gist</b> 權限即可<br>4. 複製 Token 貼到上方</div><div class="btn-row"><button class="btn btn-ghost" onclick="closeSettings()">取消</button><button class="btn btn-primary" onclick="doSaveCloudConfig()" style="flex:2;">💾 儲存同步設定</button></div>${cloudConfig.lastSync?'<div class="sync-last">🕐 最後同步：'+cloudConfig.lastSync+'</div>':''}</div><div class="settings-section"><div class="settings-section-title">🤖 AI 辨識設定</div><p style="font-size:13px;color:var(--rose-300);margin-bottom:12px;">使用 Google Gemini 免費 API，拍照或上傳圖片自動辨識配方資料。iPad 亦可使用相機拍攝配方紙。</p><div class="field"><label>Gemini API Key</label><input id="s-geminiKey" class="sync-input" value="${esc(geminiConfig.apiKey||'')}" placeholder="AIzaSyxxxxxxxxxxxxxxxxxxx"></div><div class="sync-hint">📌 取得 API Key：<br>1. 前往 <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:#4f46e5;">Google AI Studio</a><br>2. 用 Google 帳號登入<br>3. 按「Create API Key」<br>4. 複製 Key 貼到上方<br><br>💡 免費！每日 1,500 次辨識，唔使信用卡</div><div class="btn-row"><button class="btn btn-ghost" onclick="closeSettings()">取消</button><button class="btn btn-primary" onclick="doSaveGeminiConfig()" style="flex:2;">🤖 儲存 AI 設定</button></div></div></div><div class="settings-section"><div class="settings-section-title">常用成分庫</div><p style="font-size:13px;color:var(--rose-300);margin-bottom:8px;">輸入成分時會自動建議以下材料，不可編輯（系統內建）。</p><div style="font-size:12px;color:var(--rose-400);line-height:1.8;">${Object.entries(INGREDIENT_DB).map(([cat,items])=>`<b>${cat}：</b>${items.slice(0,6).map(i=>i.name).join('、')}…等 ${items.length} 種`).join('<br>')}</div></div>`;}
   function renderCfTemplateManager(){if(!cfTemplates.length)return`<div style="font-size:13px;color:var(--rose-300);margin-bottom:8px;">尚未設定任何範本</div>`;return cfTemplates.map((tpl,ti)=>`<div class="tpl-item"><div class="tpl-item-header"><span class="tpl-item-tag">🏷 ${esc(tpl.tag)}</span><button class="icon-btn" onclick="delCfTemplate(${ti})">🗑️</button></div>${(tpl.fields||[]).map((f,fi)=>`<div class="tpl-field-line"><input value="${esc(f.name)}" placeholder="欄位名稱" oninput="cfTemplates[${ti}].fields[${fi}].name=this.value;saveCfTpl()"><select onchange="cfTemplates[${ti}].fields[${fi}].type=this.value;saveCfTpl()">${CF_TYPES.map(t=>`<option value="${t.v}" ${f.type===t.v?'selected':''}>${t.l}</option>`).join('')}</select><button class="icon-btn" onclick="delCfTplField(${ti},${fi})">✕</button></div>`).join('')}<button class="btn btn-sm" style="width:100%;margin-top:4px;" onclick="addCfTplField(${ti})">＋ 加欄位</button></div>`).join('');}
   function addCfTemplate(){const tag=prompt('標籤名稱（例：命理調香）：');if(!tag||!tag.trim())return;if(cfTemplates.find(t=>t.tag===tag.trim())){alert('呢個標籤已有範本');return;}cfTemplates.push({tag:tag.trim(),fields:[{name:'',type:'text'}]});saveCfTpl();renderSettingsModal();}
   function delCfTemplate(ti){if(confirm('刪除此範本？')){cfTemplates.splice(ti,1);saveCfTpl();renderSettingsModal();}}
